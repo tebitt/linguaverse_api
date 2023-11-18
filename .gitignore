@@ -1,0 +1,4 @@
+.env
+temp/
+json/
+.DS_Store
