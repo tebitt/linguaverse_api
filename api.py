@@ -1,4 +1,4 @@
-from flask import Flask, request
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_pymongo import MongoClient, ObjectId
 import openai
@@ -18,28 +18,63 @@ from pydub import AudioSegment
 from pydub.playback import play
 import io
 from langdetect import detect
+import shutil
+from werkzeug.utils import secure_filename
+import sounddevice as sd
+import soundfile as sf
+import threading
+
 
 app = Flask(__name__)
 CORS(app)
+recording_thread = None
+recording_flag = threading.Event()
+
+def record_audio(filename='temp/audio.wav', fs=44100, channels=1):
+    global recording_flag
+    with sf.SoundFile(filename, mode='w', samplerate=fs, channels=channels) as file:
+        with sd.InputStream(samplerate=fs, channels=channels, callback=lambda indata, frames, time, status: file.write(indata)):
+            recording_flag.wait()  # Wait for stop signal
 
 @app.route('/ai', methods=['GET'])
 def ai():
     openai.api_key = os.getenv('OPENAI_API_KEY')
     return openai.Model.list()
 
+
+@app.route('/start', methods=['GET'])
+def start_recording():
+    global recording_thread, recording_flag
+    if recording_thread is None or not recording_thread.is_alive():
+        recording_flag.clear()
+        recording_thread = threading.Thread(target=record_audio)
+        recording_thread.start()
+        return jsonify({"message": "Recording started"}), 200
+    else:
+        return jsonify({"error": "Recording is already in progress"}), 400
+
+@app.route('/stop', methods=['GET'])
+def stop_recording():
+    global recording_thread, recording_flag
+    if recording_thread is not None and recording_thread.is_alive():
+        recording_flag.set()
+        recording_thread.join()
+        return jsonify({"message": "Recording stopped"}), 200
+    else:
+        return jsonify({"error": "No recording in progress"}), 400
 # Main endpoint for processing chat. It performs several operations
-@app.route('/chat', method=['GET'])
+@app.route('/chat', methods=['GET','POST'])
 def chat():
     load_dotenv()
-    # Connect to MongoDB and fetches the latest image and audio URLs
+    # Connect to MongoDB and fetches the latest image and audio 
     mongo = MongoClient(os.getenv('MONGO_URI'))
     openai.api_key = os.getenv('OPENAI_API_KEY')
     db = mongo['lingua']
     collection = db['preset_log']
     img_collection = db['photo']
-    audio_collection = db['audio']
+    # audio_collection = db['audio']
     url = img_collection.find().sort('_id', -1).limit(1).next() 
-    audio_url = audio_collection.find().sort('_id', -1).limit(1).next() 
+    # audio_url = audio_collection.find().sort('_id', -1).limit(1).next() 
     # Extracting file ID from the Google Drive URL
     object_id_str = os.getenv('PRIMING_OBJECT_ID')
     object_id = ObjectId(object_id_str)    
@@ -49,17 +84,20 @@ def chat():
     messages = json.loads(item_dict['messages'])
     init_text(messages)
     file_id = extract_file_id_from_google_drive_url(url['file_url'])
-    audio_id = extract_file_id_from_google_drive_url(audio_url['file_url'])
+    # audio_id = extract_file_id_from_google_drive_url(audio_url['file_url'])
     # Creating a direct download URL for the Google Drive file
     file_url = f'https://drive.google.com/uc?id={file_id}&export=download'
-    audio_url = f'https://drive.google.com/uc?id={audio_id}&export=download'
+    # audio_url = f'https://drive.google.com/uc?id={audio_id}&export=download'
     destination = os.path.join(r'./temp', 'ad.jpg')
     # Downloads the image and audio from Google Drive
     download_file_from_google_drive(file_url, destination)
-    destination = os.path.join(r'./temp', 'audio.wav')
-    download_file_from_google_drive(audio_url, destination)
+    # destination = os.path.join(r'./temp', 'audio.wav')
+    # download_file_from_google_drive(audio_url, destination)
     # Transcribes the audio file
+    # user_input = request.json.get('input') #get input from request
+    # shutil.move('../Downloads/audio.wav', 'temp/audio.wav')
     user_input = transcribe('temp/audio.wav')
+    print(user_input)
     # Prepare the prompt for the GPT model adding the user's input collected from the transcription
     prepare_prompt(user_input)
     with open('temp/logs.json', 'r') as f:
@@ -74,7 +112,7 @@ def chat():
     # Converts the GPT response to speech using Google Cloud TTS outputing a mp3 file called output.mp3
     text_to_speech(answer, language)
     play_audio('temp/output.mp3')
-    return answer
+    return answer + '\n'
 
 # Initialize the chat logs. If the logs file doesn't exist, it creates one
 def init_text(message):
@@ -177,7 +215,7 @@ def text_to_speech(text, language_code):
     language_code = language_mapping[language_code]
     client = texttospeech.TextToSpeechClient()
     synthesis_input = texttospeech.SynthesisInput(text=text)
-    voice = texttospeech.VoiceSelectionParams(language_code=language_code, ssml_gender=texttospeech.SsmlVoiceGender.NEUTRAL)
+    voice = texttospeech.VoiceSelectionParams(language_code=language_code, ssml_gender=texttospeech.SsmlVoiceGender.FEMALE)
     audio_config = texttospeech.AudioConfig(audio_encoding=texttospeech.AudioEncoding.MP3)
     response = client.synthesize_speech(input=synthesis_input, voice=voice, audio_config=audio_config)
     with open("temp/output.mp3", "wb") as out:
@@ -208,4 +246,8 @@ def close():
 if __name__ == '__main__':
     if not os.path.exists('temp'):
         os.makedirs('temp')
+    if os.path.exists('temp/logs.json'):
+        os.remove('temp/logs.json')
+    if os.path.exists('temp/ad.jpg'):
+        os.remove('temp/ad.jpg')
     app.run(port='6969', debug=True)
